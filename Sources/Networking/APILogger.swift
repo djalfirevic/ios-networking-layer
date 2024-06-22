@@ -14,6 +14,8 @@ public struct APILogger {
     public static var isLoggingEnabled = true
 
     public static func logDataResponse<T>(_ response: DataResponse<T>) {
+        guard Self.isLoggingEnabled else { return }
+        
         var console = ""
 
         if let url = response.request?.url?.absoluteString.removingPercentEncoding, let method = response.request?.httpMethod {
