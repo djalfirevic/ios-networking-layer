@@ -40,12 +40,11 @@ final public class NetworkManager {
     /// - Parameters:
     ///   - endpoint: the endpoint to make the HTTP request against
     public func request<T: Decodable>(endpoint: API) -> AnyPublisher<T, APIError> {
-        if !Reachability.isConnectedToNetwork() {
+        guard Reachability.isConnectedToNetwork() else {
             return AnyPublisher(Fail<T, APIError>(error: APIError.error(reason: "Please provide Internet connection")))
         }
 
-        let components = buildURL(endpoint: endpoint)
-        guard let url = components.url else {
+        guard let url = buildURL(endpoint: endpoint).url else {
             return AnyPublisher(Fail<T, APIError>(error: APIError.invalidURL))
         }
 
@@ -55,40 +54,12 @@ final public class NetworkManager {
             .retry(1)
             .receive(on: DispatchQueue.main)
             .tryMap { data, response in
-                let dataResponse = DataResponse<Bool>(
-                    request: urlRequest,
-                    response: response as? HTTPURLResponse,
-                    result: .success(true),
-                    data: data
-                )
-                APILogger.logDataResponse(dataResponse)
-
-                let decoder = JSONDecoder()
-
-                let dateFormatter = DateFormatter()
-                dateFormatter.dateFormat = "yyyy-mm-dd"
-                decoder.dateDecodingStrategy = .formatted(dateFormatter)
-
-                if let httpResponse = response as? HTTPURLResponse {
-                    let responseStatus = ResponseStatus(statusCode: httpResponse.statusCode)
-                    switch responseStatus {
-                    case .unauthorized:
-                        throw APIError.unauthorized
-                    case .clientError, .serverError:
-                        throw APIError.error(reason: "Server error")
-                    default:
-                        break
-                    }
-                }
-
-                return try decoder.decode(T.self, from: data)
+                self.logDataResponse(data: data, response: response, request: urlRequest)
+                try self.handleResponse(response: response)
+                return try self.decode(data: data, to: T.self)
             }
             .mapError { error in
-                if let error = error as? APIError {
-                    return error
-                } else {
-                    return APIError.error(reason: error.localizedDescription)
-                }
+                return self.mapError(error)
             }
             .eraseToAnyPublisher()
     }
@@ -98,60 +69,39 @@ final public class NetworkManager {
     ///   - endpoint: the endpoint to make the HTTP request against
     ///   - completion: completion handler
     public func request<T: Decodable>(endpoint: API, _ completion: @escaping (Result<T, APIError>) -> Void) {
-        if !Reachability.isConnectedToNetwork() {
+        guard Reachability.isConnectedToNetwork() else {
             completion(.failure(APIError.error(reason: "Please provide Internet connection")))
             return
         }
 
-        let components = buildURL(endpoint: endpoint)
-        guard let url = components.url else {
+        guard let url = buildURL(endpoint: endpoint).url else {
             completion(.failure(APIError.invalidURL))
             return
         }
 
-        // Create URLRequest.
         let urlRequest = createRequest(url: url, endpoint: endpoint)
 
-        session.dataTask(with: urlRequest) { data, response, error in
+        session.dataTask(with: urlRequest) { [weak self] data, response, error in
+            guard let self else { return }
+
             DispatchQueue.main.async {
-                let dataResponse = DataResponse<Bool>(
-                    request: urlRequest,
-                    response: response as? HTTPURLResponse,
-                    result: .success(true),
-                    data: data
-                )
-                APILogger.logDataResponse(dataResponse)
+                self.logDataResponse(data: data, response: response, request: urlRequest)
 
-                if let httpResponse = response as? HTTPURLResponse {
-                    let responseStatus = ResponseStatus(statusCode: httpResponse.statusCode)
-                    switch responseStatus {
-                    case .unauthorized:
-                        completion(.failure(APIError.unauthorized))
-                    case .clientError, .serverError:
-                        completion(.failure(APIError.error(reason: "Server error")))
-                    default:
-                        break
-                    }
-                }
-
-                if let error {
+                if let error = error {
                     completion(.failure(APIError.error(reason: error.localizedDescription)))
                     return
                 }
 
-                if let data {
-                    let decoder = JSONDecoder()
-
-                    let dateFormatter = DateFormatter()
-                    dateFormatter.dateFormat = "yyyy-mm-dd"
-                    decoder.dateDecodingStrategy = .formatted(dateFormatter)
-
-                    do {
-                        let object = try decoder.decode(T.self, from: data)
-                        completion(.success(object))
-                    } catch {
-                        completion(.failure(APIError.error(reason: error.localizedDescription)))
+                do {
+                    try self.handleResponse(response: response)
+                    if let data = data {
+                        let decodedObject = try self.decode(data: data, to: T.self)
+                        completion(.success(decodedObject))
+                    } else {
+                        completion(.failure(APIError.error(reason: "No data received")))
                     }
+                } catch {
+                    completion(.failure(APIError.error(reason: error.localizedDescription)))
                 }
             }
         }.resume()
@@ -161,60 +111,67 @@ final public class NetworkManager {
     /// - Parameters:
     ///   - endpoint: the endpoint to make the HTTP request against
     public func request<T: Decodable>(endpoint: API) async throws -> T {
-        if !Reachability.isConnectedToNetwork() {
+        guard Reachability.isConnectedToNetwork() else {
             throw APIError.error(reason: "Please provide Internet connection")
         }
 
-        let components = buildURL(endpoint: endpoint)
-        guard let url = components.url else {
+        guard let url = buildURL(endpoint: endpoint).url else {
             throw APIError.invalidURL
         }
 
         let urlRequest = createRequest(url: url, endpoint: endpoint)
-
         let (data, response) = try await session.data(for: urlRequest)
 
+        logDataResponse(data: data, response: response, request: urlRequest)
+        try handleResponse(response: response)
+
+        return try decode(data: data, to: T.self)
+    }
+
+    // MARK: - Private API
+
+    private func logDataResponse(data: Data?, response: URLResponse?, request: URLRequest) {
         let dataResponse = DataResponse<Bool>(
-            request: urlRequest,
+            request: request,
             response: response as? HTTPURLResponse,
             result: .success(true),
             data: data
         )
+
         APILogger.logDataResponse(dataResponse)
+    }
 
-        // Handle responses with success (200, 201, ...)
-        if data.isEmpty, let response = response as? HTTPURLResponse {
-            let responseStatus = ResponseStatus(statusCode: response.statusCode)
-            let value = responseStatus == .success
-            return value as! T
-        }
-
+    private func decode<T: Decodable>(data: Data, to type: T.Type) throws -> T {
         let decoder = JSONDecoder()
-
         let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-mm-dd"
+        dateFormatter.dateFormat = "yyyy-MM-dd"
         decoder.dateDecodingStrategy = .formatted(dateFormatter)
+        return try decoder.decode(T.self, from: data)
+    }
 
-        if let httpResponse = response as? HTTPURLResponse {
-            let responseStatus = ResponseStatus(statusCode: httpResponse.statusCode)
-            switch responseStatus {
-            case .unauthorized:
-                throw APIError.unauthorized
-            case .clientError, .serverError:
-                throw APIError.error(reason: "Server error")
-            default:
-                break
-            }
+    private func handleResponse(response: URLResponse?) throws {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.error(reason: "Invalid response")
         }
 
-        do {
-            return try decoder.decode(T.self, from: data)
-        } catch {
-            throw error
+        let responseStatus = ResponseStatus(statusCode: httpResponse.statusCode)
+        switch responseStatus {
+        case .unauthorized:
+            throw APIError.unauthorized
+        case .clientError, .serverError:
+            throw APIError.error(reason: "Server error")
+        default:
+            break
         }
     }
 
-    // MARK: - Private API
+    private func mapError(_ error: Error) -> APIError {
+        if let apiError = error as? APIError {
+            return apiError
+        } else {
+            return APIError.error(reason: error.localizedDescription)
+        }
+    }
 
     private func createRequest(url: URL, endpoint: API) -> URLRequest {
         var urlRequest = URLRequest(url: url)
