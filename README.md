@@ -82,6 +82,7 @@ struct FlickrResponse: Codable {
 
 We can make a request like this:
 
+### async\await
 ```swift
 Task {
     do {
@@ -93,6 +94,7 @@ Task {
 }
 ```
 
+### Completion handler
 ```swift
 NetworkManager.shared.request(endpoint: MainAPI.photos) { (result: Result<FlickrResponse, APIError>) in
     switch result {
@@ -102,4 +104,23 @@ NetworkManager.shared.request(endpoint: MainAPI.photos) { (result: Result<Flickr
             print("Error \(error.localizedDescription)")
     }
 }
+```
+
+### Combine
+```swift
+private var cancellables = Set<AnyCancellable>()
+
+NetworkManager.shared.request(endpoint: MainAPI.photos)
+    .sink(receiveCompletion: { completion in
+        switch completion {
+            case .finished:
+                // Handle successful completion
+                break
+            case .failure(let error):
+                print("Error \(error.localizedDescription)")
+            }
+    }, receiveValue: { (response: FlickrResponse) in
+        print(response.title)
+    })
+    .store(in: &cancellables)
 ```
